@@ -6,34 +6,33 @@ import com.itextpdf.text.pdf.PdfDictionary;
 import com.itextpdf.text.pdf.PdfName;
 import com.itextpdf.text.pdf.PdfReader;
 import com.itextpdf.text.pdf.parser.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PDF 关键字位置查找器
+ * PDF 关键字位置查找器（精简版）
+ * 返回包含关键字的整个文本片段的基线左下角坐标
  */
 public class PdfKeywordFinder {
+    private static final Logger log = LoggerFactory.getLogger(PdfKeywordFinder.class);
 
-    /**
-     * 在 PDF 文档中查找指定关键字的所有出现位置
-     *
-     * @param pdfData PDF 文件的字节数组
-     * @param keyword 要查找的关键字
-     * @return 关键字位置列表（每个关键字取第一个字符的位置）
-     * @throws IOException 解析异常
-     */
     public static List<PdfKeywordPosition> findPositions(byte[] pdfData, String keyword) throws IOException {
         List<PdfKeywordPosition> result = new ArrayList<>();
         List<PdfPageContentPositions> pageContentPositions = getPdfContentPositionsList(pdfData);
 
-        for (PdfPageContentPositions pageContentPosition : pageContentPositions) {
-            List<PdfKeywordPosition> positions = findPositionsInPage(keyword, pageContentPosition);
-            if (positions != null && !positions.isEmpty()) {
+        for (int i = 0; i < pageContentPositions.size(); i++) {
+            PdfPageContentPositions pageContentPosition = pageContentPositions.get(i);
+            List<PdfKeywordPosition> positions = findPositionsInPage(keyword, pageContentPosition, i + 1);
+            if (!positions.isEmpty()) {
                 result.addAll(positions);
             }
         }
+
+        log.info("关键字 '{}' 查找完成，共找到 {} 个位置", keyword, result.size());
         return result;
     }
 
@@ -42,22 +41,22 @@ public class PdfKeywordFinder {
         try {
             List<PdfPageContentPositions> result = new ArrayList<>();
             int pages = reader.getNumberOfPages();
-            for (int pageNum = 1; pageNum <= pages; pageNum++) {
-                float width = reader.getPageSize(pageNum).getWidth();
-                float height = reader.getPageSize(pageNum).getHeight();
 
-                PdfRenderListener listener = new PdfRenderListener(pageNum, width, height);
+            for (int pageNum = 1; pageNum <= pages; pageNum++) {
+                PdfRenderListener listener = new PdfRenderListener(pageNum);
                 PdfContentStreamProcessor processor = new PdfContentStreamProcessor(listener);
                 PdfDictionary pageDic = reader.getPageN(pageNum);
                 PdfDictionary resourcesDic = pageDic.getAsDict(PdfName.RESOURCES);
-                processor.processContent(ContentByteUtils.getContentBytesForPage(reader, pageNum), resourcesDic);
+
+                byte[] pageContent = ContentByteUtils.getContentBytesForPage(reader, pageNum);
+                processor.processContent(pageContent, resourcesDic);
 
                 String content = listener.getContent();
-                List<PdfKeywordPosition> positions = listener.getCharPositions();
+                List<TextFragment> fragments = listener.getFragments();
 
                 PdfPageContentPositions pageContentPositions = new PdfPageContentPositions();
                 pageContentPositions.setContent(content);
-                pageContentPositions.setPositions(positions);
+                pageContentPositions.setFragments(fragments);
 
                 result.add(pageContentPositions);
             }
@@ -67,95 +66,119 @@ public class PdfKeywordFinder {
         }
     }
 
-    private static List<PdfKeywordPosition> findPositionsInPage(String keyword, PdfPageContentPositions pageContentPositions) {
+    /**
+     * 在单页中查找关键字，返回包含关键字的整个文本片段的基线左下角坐标
+     */
+    private static List<PdfKeywordPosition> findPositionsInPage(String keyword,
+                                                                PdfPageContentPositions pageContentPositions, int pageNum) {
         List<PdfKeywordPosition> result = new ArrayList<>();
         String content = pageContentPositions.getContent();
-        List<PdfKeywordPosition> charPositions = pageContentPositions.getPositions();
+        List<TextFragment> fragments = pageContentPositions.getFragments();
 
         for (int pos = 0; pos < content.length(); ) {
             int positionIndex = content.indexOf(keyword, pos);
             if (positionIndex == -1) {
                 break;
             }
-            // 取关键字第一个字符的位置（原逻辑如此）
-            result.add(charPositions.get(positionIndex));
+
+            // 查找包含该起始索引的文本片段
+            TextFragment targetFragment = null;
+            int currentPos = 0;
+            for (TextFragment fragment : fragments) {
+                int fragmentStart = currentPos;
+                int fragmentEnd = currentPos + fragment.text.length() - 1;
+                if (positionIndex >= fragmentStart && positionIndex <= fragmentEnd) {
+                    targetFragment = fragment;
+                    break;
+                }
+                currentPos += fragment.text.length();
+            }
+
+            if (targetFragment == null) {
+                pos = positionIndex + 1;
+                continue;
+            }
+
+            // 获取该片段的基线矩形左下角坐标
+            Rectangle2D.Float rect = targetFragment.baselineRect;
+            result.add(new PdfKeywordPosition(pageNum, rect.x, rect.y));
             pos = positionIndex + 1;
         }
+
         return result;
     }
 
     /**
-     * 单页内容和字符位置集合
+     * 文本片段信息
      */
-    private static class PdfPageContentPositions {
-        private String content;
-        private List<PdfKeywordPosition> positions;
+    private static class TextFragment {
+        String text;
+        Rectangle2D.Float baselineRect;
 
-        public String getContent() {
-            return content;
-        }
-
-        public void setContent(String content) {
-            this.content = content;
-        }
-
-        public List<PdfKeywordPosition> getPositions() {
-            return positions;
-        }
-
-        public void setPositions(List<PdfKeywordPosition> positions) {
-            this.positions = positions;
+        TextFragment(String text, Rectangle2D.Float baselineRect) {
+            this.text = text;
+            this.baselineRect = baselineRect;
         }
     }
 
     /**
-     * 渲染监听器，提取字符内容和位置
+     * 单页内容和文本片段列表
+     */
+    private static class PdfPageContentPositions {
+        private String content;
+        private List<TextFragment> fragments;
+
+        public String getContent() { return content; }
+        public void setContent(String content) { this.content = content; }
+        public List<TextFragment> getFragments() { return fragments; }
+        public void setFragments(List<TextFragment> fragments) { this.fragments = fragments; }
+    }
+
+    /**
+     * 渲染监听器，提取文本片段及其基线矩形
      */
     private static class PdfRenderListener implements RenderListener {
-        private final int pageNum;
-        private final float pageWidth;
-        private final float pageHeight;
-        private final StringBuilder contentBuilder = new StringBuilder();
-        private final List<PdfKeywordPosition> charPositions = new ArrayList<>();
+        private static final Logger log = LoggerFactory.getLogger(PdfRenderListener.class);
 
-        public PdfRenderListener(int pageNum, float pageWidth, float pageHeight) {
+        private final int pageNum;
+        private final StringBuilder contentBuilder = new StringBuilder();
+        private final List<TextFragment> fragments = new ArrayList<>();
+
+        public PdfRenderListener(int pageNum) {
             this.pageNum = pageNum;
-            this.pageWidth = pageWidth;
-            this.pageHeight = pageHeight;
         }
 
         @Override
-        public void beginTextBlock() {
-        }
+        public void beginTextBlock() { }
 
         @Override
         public void renderText(TextRenderInfo renderInfo) {
-            List<TextRenderInfo> characterRenderInfos = renderInfo.getCharacterRenderInfos();
-            for (TextRenderInfo textRenderInfo : characterRenderInfos) {
-                String word = textRenderInfo.getText();
-                if (word.length() > 1) {
-                    word = word.substring(word.length() - 1);
-                }
-                Rectangle2D.Float rectangle = textRenderInfo.getAscentLine().getBoundingRectange();
-                charPositions.add(new PdfKeywordPosition(pageNum, rectangle.x, rectangle.y));
-                contentBuilder.append(word);
+            String text = renderInfo.getText();
+            if (text == null || text.isEmpty()) {
+                return;
+            }
+
+            try {
+                Rectangle2D.Float rect = renderInfo.getBaseline().getBoundingRectange();
+                fragments.add(new TextFragment(text, rect));
+                contentBuilder.append(text);
+            } catch (Exception e) {
+                log.error("第 {} 页 - 处理文本片段时发生异常", pageNum, e);
             }
         }
 
         @Override
-        public void endTextBlock() {
-        }
+        public void endTextBlock() { }
 
         @Override
-        public void renderImage(ImageRenderInfo renderInfo) {
-        }
+        public void renderImage(ImageRenderInfo renderInfo) { }
 
         public String getContent() {
             return contentBuilder.toString();
         }
 
-        public List<PdfKeywordPosition> getCharPositions() {
-            return charPositions;
+        public List<TextFragment> getFragments() {
+            return fragments;
         }
     }
 }
